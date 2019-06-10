@@ -28,20 +28,18 @@ typedef enum _log_media
 class Logger
 {
 private:
-	char *m_log_name;
 	time_t m_starttime;
 	pthread_mutex_t m_mutex;
 	LogMedia m_media_type;
-	char *m_msg_buffer1, *m_msg_buffer2, *m_console_log_buffer;
+	char *m_msg_buffer1, *m_msg_buffer2, *m_console_log_buffer, *m_log_name;
 	struct sockaddr_in m_server_addr;
 	int m_socket;
 	char *m_udp_addr;
 
 
 	/* ********************************************************** */
-	int setup_log_console(const char * buffer)
+	int setup_log_console()
 	{
-		m_console_log_buffer = buffer;
 		m_media_type = LOG_MEDIA_CONSOLE;
 
 		return 0;
@@ -63,8 +61,8 @@ private:
 		FILE *logfp;
 
 
-		logfp = fopen(log_name, "a");
-		if (logfp == NULL)
+		logfp = fopen(log_name, "w");
+		if (logfp != NULL)
 		{
 			m_log_name = (char *)malloc(strlen(log_name)*sizeof(char));
 			if (m_log_name != NULL)
@@ -224,7 +222,7 @@ public:
 						retval = setup_log_udp(target);
 						break;
 					case LOG_MEDIA_CONSOLE:
-						setup_log_console(target);
+						setup_log_console();
 						break;
 					default:
 						break;
@@ -232,7 +230,7 @@ public:
 
 					if (retval != 0)
 					{
-						setup_log_console(target);
+						setup_log_console();
 					}
 				}
 			}
@@ -240,19 +238,15 @@ public:
 
 		pthread_mutex_unlock(&m_mutex);
 	}
-	
-	Logger(LogMedia media)
-	{
-		Logger(media, NULL);
-	}		
 
 	int print(int syslog_logtype, const char * format, ...)
 	{
 		time_t uptime, rawtime;
 		struct tm * timeinfo;
 		va_list args;
-		char systime_buffer[80], uptime_buffer[80], tmp_buffer[80], error_type[32];
+		char systime_buffer[80], uptime_buffer[80], tmp_buffer[80];
 		const char * error_str;
+
 
 		pthread_mutex_lock(&m_mutex);
 
@@ -264,8 +258,7 @@ public:
 		timeinfo = localtime(&uptime);
 		strftime(tmp_buffer, 80, "%H:%M:%S", timeinfo);
 		snprintf(uptime_buffer, 80, "%ldd %s", (uptime / 86400), tmp_buffer);
-
-
+		
 		if (m_msg_buffer1 == NULL || m_msg_buffer2 == NULL)
 		{
 			return -1;
@@ -274,33 +267,34 @@ public:
 		switch (syslog_logtype)
 		{
 		case LOG_DEBUG:
-			error_str = "DEBUG: ";
+			error_str = "DEBUG";
 			break;
 		case LOG_INFO:
-			error_str = "INFO: ";
+			error_str = "INFO";
 			break;
 		case LOG_NOTICE:
-			error_str = "NOTICE: ";
+			error_str = "NOTICE";
 			break;
 		case LOG_WARNING:
-			error_str = "WARNING: ";
+			error_str = "WARNING";
 			break;
 		case LOG_ERR:
-			error_str = "ERROR: ";
+			error_str = "ERROR";
 			break;
 		case LOG_CRIT:
-			error_str = "CRITICAL: ";
+			error_str = "CRITICAL";
 			break;
 		case LOG_ALERT:
-			error_str = "ALERT: ";
+			error_str = "ALERT";
 			break;
 		default:
 			error_str = "";
 			break;
 		}
 
-		sprintf(m_msg_buffer1, "%s [%s]: %12s : ", systime_buffer, uptime_buffer, error_type);
-		vsprintf(m_msg_buffer2, format, args);
+		snprintf(m_msg_buffer1, LOG_MSG_LENGTH, "%s [%s]: %s : ", systime_buffer, uptime_buffer, error_str);
+		va_start (args, format);
+		vsnprintf(m_msg_buffer2, LOG_MSG_LENGTH, format, args);
 
 		switch (m_media_type)
 		{
@@ -308,11 +302,12 @@ public:
 			print_log_file(m_msg_buffer1, m_msg_buffer2);
 			break;
 		case LOG_MEDIA_SYSLOG:
-			sprintf(m_msg_buffer1, "%s [%s]: ", systime_buffer, uptime_buffer);
-			syslog(syslog_logtype, "%s%s", m_msg_buffer1, m_msg_buffer2);
+			syslog(syslog_logtype, "[%s] %s", uptime_buffer, m_msg_buffer2);
 			break;
 		case LOG_MEDIA_UDP:
-			int ret = sendto(m_socket, m_msg_buffer1, strlen(m_msg_buffer1), 0, (struct sockaddr *)&m_server_addr, sizeof(m_server_addr));
+			int ret;
+
+			ret = sendto(m_socket, m_msg_buffer1, strlen(m_msg_buffer1), 0, (struct sockaddr *)&m_server_addr, sizeof(m_server_addr));
 			if (ret < 0)
 			{
 				perror("sendto #1 failed");
@@ -324,11 +319,11 @@ public:
 			}
 			break;
 		case LOG_MEDIA_CONSOLE:
-			snprintf(m_console_log_buffer, "%s%s", m_msg_buffer1, m_msg_buffer2);
+			snprintf(m_console_log_buffer, LOG_MSG_LENGTH,"%s %s\n", m_msg_buffer1, m_msg_buffer2);
 			log(m_console_log_buffer);
 			break;
 		default:
-			fprintf(stderr, "%s%s", m_msg_buffer1, m_msg_buffer2);
+			fprintf(stderr, "%s %s", m_msg_buffer1, m_msg_buffer2);
 			break;
 		}
 
