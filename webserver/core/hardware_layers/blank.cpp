@@ -34,6 +34,7 @@
 #include <errno.h>
 #include <sys/select.h>
 #include <sys/stat.h>
+#include <gpiod.h>
 
 #include "ladder.h"
 #include "custom_layer.h"
@@ -43,35 +44,35 @@
 #define ARRAY_SIZE(x) (sizeof((x)) / sizeof((x)[0]))
 #endif
 
-#define MAX_INPUT 		  16
-#define MAX_OUTPUT 		  16
-#define MAX_PWM_OUT	      16
+//#define DUTY_SCALING      30.518043793392843518730449378195
+#define PWM_PERIOD_500HZ  2000000
+#define PWM_DUTY_SCALING  20000
+
+#define MAX_GPIO_INPUTS	  16
+#define MAX_GPIO_OUTPUTS  16
+#define MAX_PWM_OUTPUTS   16
 
 #define GPIO_IN_OFFSET    480
 #define GPIO_OUT_OFFSET   464
 
-#define GPIO_DIR_IN       0
-#define GPIO_DIR_OUT_LOW  1
-#define GPIO_DIR_OUT_HIGH 2
-
-#define GPIO_VAL_LOW      0
-#define GPIO_VAL_HIGH     1
-
 #define LOG_MSG_LENGTH    256
 #define SMALL_BUFF_SIZE   256
 
-int gpio_export(int gpio);
-int gpio_direction(int gpio, int dir);
-void gpio_unexport(int gpio);
-int gpio_read(int gpio);
-int gpio_write(int gpio, int val);
-
 int pwm_export(int pwm);
 void pwm_unexport(int pwm);
-int pwm_read(int pwm, unsigned long *freq, unsigned long *duty, int *enable);
-int pwm_write(int pwm, unsigned long freq, unsigned long duty, int enable);
+IEC_UDINT pwm_read(int pwm);
+int write_pwm_param(int pwm, const char* param_name, IEC_UDINT value);
+int pwm_write(int pwm, IEC_UDINT value);
 
 Logger *g_logger;
+IEC_UDINT g_int_pwm_val_buffer[MAX_PWM_OUTPUTS];
+IEC_BOOL g_bool_pwm_en_buffer[MAX_PWM_OUTPUTS];
+
+
+struct gpiod_chip *g_gpio_input_chip;
+struct gpiod_chip *g_gpio_output_chip;
+struct gpiod_line_bulk g_bulk_in;
+struct gpiod_line_bulk g_bulk_out;
 
 //-----------------------------------------------------------------------------
 // This function is called by the main OpenPLC routine when it is initializing.
@@ -79,64 +80,96 @@ Logger *g_logger;
 //-----------------------------------------------------------------------------
 void initializeHardware()
 {
-	g_logger = new Logger(LOG_MEDIA_UDP, "192.168.0.102:1888");
+	int rv;
+	int def_vals[MAX_GPIO_OUTPUTS];
 
 
+	g_logger = new Logger(LOG_MEDIA_FILE, "/tmp/log.txt");
 	g_logger->print(LOG_INFO, "%s: Starting\n", __func__);
 
 	// Configure digital inputs
-	for (int i = 0; i < MAX_INPUT; i++)
+	g_gpio_input_chip = gpiod_chip_open_lookup("gpiochip6");
+	if (g_gpio_input_chip == NULL)
 	{
-		if (pinNotPresent(ignored_bool_inputs, ARRAY_SIZE(ignored_bool_inputs), i))
-		{
-			gpio_export(GPIO_IN_OFFSET + i);
-			gpio_direction(GPIO_IN_OFFSET + i, GPIO_DIR_IN);
-		}
+		g_logger->print(LOG_ERR, "%s: Failed to open \"gpiochip6\" Error: %s\n", __func__, strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+	if (gpiod_chip_get_all_lines(g_gpio_input_chip, &g_bulk_in) != 0)
+	{
+		g_logger->print(LOG_ERR, "%s: Failed to retrieve gpio lines.\n", __func__);
+		exit(EXIT_FAILURE);
+	}
+	if (gpiod_line_request_bulk_input(&g_bulk_in, "OPLC") != 0)
+	{
+		g_logger->print(LOG_ERR, "%s: Failed to assign gpio lines IN.\n", __func__);
+		exit(EXIT_FAILURE);
 	}
 
 	// Configure digital outputs
-	for (int i = 0; i < MAX_OUTPUT; i++)
+	for (int i = 0; i < MAX_GPIO_OUTPUTS; i++)
 	{
-		if (pinNotPresent(ignored_bool_outputs, ARRAY_SIZE(ignored_bool_outputs), i))
-		{
-			gpio_export(GPIO_OUT_OFFSET + i);
-			gpio_direction(GPIO_OUT_OFFSET + i, GPIO_DIR_OUT_LOW);
-		}
+		def_vals[i] = 0;
 	}
-/*
+
+	g_gpio_output_chip = gpiod_chip_open_lookup("gpiochip7");
+	if (g_gpio_output_chip == NULL)
+	{
+		g_logger->print(LOG_ERR, "%s: Failed to open \"gpiochip7\" Error: %s\n", __func__, strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+	if (gpiod_chip_get_all_lines(g_gpio_output_chip, &g_bulk_out) != 0)
+	{
+		g_logger->print(LOG_ERR, "%s: Failed to retrieve \"gpiochip7\" lines.\n", __func__);
+		exit(EXIT_FAILURE);
+	}
+	if (gpiod_line_request_bulk_output(&g_bulk_out, "OPLC", def_vals) != 0)
+	{
+		g_logger->print(LOG_ERR, "%s: Failed to assign gpio lines OUT.\n", __func__);
+		exit(EXIT_FAILURE);
+	}
+
 	// Configure PWM outputs
-	for (int i = 0; i < MAX_PWM_OUT; i++)
+	for (int i = 0; i < MAX_PWM_OUTPUTS; i++)
 	{
 		if (pinNotPresent(ignored_int_outputs, ARRAY_SIZE(ignored_int_outputs), i))
 		{
 			pwm_export(i);
 		}
+		g_int_pwm_val_buffer[i] = 0;
+		g_bool_pwm_en_buffer[i] = 0;
+		write_pwm_param(i, "period", PWM_PERIOD_500HZ);
 	}
-*/
 	g_logger->print(LOG_INFO, "%s: Finished\n", __func__);
 }
 
+//-----------------------------------------------------------------------------
 void finalizeHardware()
 {
 	g_logger->print(LOG_INFO, "%s: Starting\n", __func__);
 
 	// Configure digital inputs
-	for (int i = 0; i < MAX_INPUT; i++)
+	if (g_gpio_input_chip != NULL)
 	{
-		if (pinNotPresent(ignored_bool_inputs, ARRAY_SIZE(ignored_bool_inputs), i))
-		{
-			gpio_unexport(GPIO_IN_OFFSET + i);
-		}
+		gpiod_line_release_bulk(&g_bulk_in);
+		gpiod_chip_close(g_gpio_input_chip);
 	}
-	
+
 	// Configure digital outputs
-	for (int i = 0; i < MAX_OUTPUT; i++)
+	if (g_gpio_output_chip != NULL)
 	{
-		if (pinNotPresent(ignored_bool_outputs, ARRAY_SIZE(ignored_bool_outputs), i))
+		gpiod_line_release_bulk(&g_bulk_out);
+		gpiod_chip_close(g_gpio_output_chip);
+	}
+
+	// Configure PWM outputs
+	for (int i = 0; i < MAX_PWM_OUTPUTS; i++)
+	{
+		if (pinNotPresent(ignored_int_outputs, ARRAY_SIZE(ignored_int_outputs), i))
 		{
-			gpio_unexport(GPIO_OUT_OFFSET + i);
+			pwm_unexport(i);
 		}
 	}
+
 	g_logger->print(LOG_INFO, "%s: Finished\n", __func__);
 	
 	delete g_logger;
@@ -149,15 +182,20 @@ void finalizeHardware()
 //-----------------------------------------------------------------------------
 void updateBuffersIn()
 {
+	const int gpio_values[MAX_GPIO_INPUTS];
+
+
 	pthread_mutex_lock(&bufferLock); //lock mutex
 
-	for (int i = 0; i < MAX_INPUT; i++)
+	gpiod_line_get_value_bulk(&g_bulk_in, gpio_values);
+
+	for (int i = 0; i < MAX_GPIO_INPUTS; i++)
 	{
 		if (pinNotPresent(ignored_bool_inputs, ARRAY_SIZE(ignored_bool_inputs), i))
 		{
 			if (bool_input[i / 8][i % 8] != NULL)
 			{
-				*bool_input[i / 8][i % 8] = gpio_read(GPIO_IN_OFFSET + i);
+				*bool_input[i / 8][i % 8] = gpio_values[i];
 			}
 		}
 	}
@@ -172,185 +210,38 @@ void updateBuffersIn()
 //-----------------------------------------------------------------------------
 void updateBuffersOut()
 {
+	int gpio_values[MAX_GPIO_OUTPUTS];
+
+
 	pthread_mutex_lock(&bufferLock); //lock mutex
 
-	//OUTPUT
-	for (int i = 0; i < MAX_OUTPUT; i++)
+	// GPIO OUT
+	for (int i = 0; i < MAX_GPIO_OUTPUTS; i++)
 	{
+		gpio_values[i] = 0;
 		if (pinNotPresent(ignored_bool_outputs, ARRAY_SIZE(ignored_bool_outputs), i))
 		{
 			if (bool_output[i / 8][i % 8] != NULL)
 			{
-				gpio_write(GPIO_OUT_OFFSET + i, *bool_output[i / 8][i % 8]);
+				gpio_values[i] = *bool_output[i / 8][i % 8];
 			}
 		}
 	}
-/*
+	gpiod_line_set_value_bulk(&g_bulk_out, gpio_values);
+
 	//ANALOG OUT (PWM)
-	for (int i = 0; i < MAX_PWM_OUT; i++)
+	for (int i = 0; i < MAX_PWM_OUTPUTS; i++)
 	{
 		if (pinNotPresent(ignored_int_outputs, ARRAY_SIZE(ignored_int_outputs), i))
 		{
 			if (int_output[i] != NULL)
 			{
-				pwm_write(i, (*int_output[i] / 64));
+				pwm_write(i, *int_output[i]);
 			}
 		}
 	}
-*/
+
 	pthread_mutex_unlock(&bufferLock); //unlock mutex
-}
-
-//-----------------------------------------------------------------------------
-int gpio_export(int gpio)
-{
-	int gpiofd;
-	char buf[SMALL_BUFF_SIZE];
-	int ret;
-
-
-	/* Quick test if it has already been exported */
-	sprintf(buf, "/sys/class/gpio/gpio%d/value", gpio);
-	gpiofd = open(buf, O_WRONLY);
-	if (gpiofd != -1)
-	{
-		close(gpiofd);
-		return 0;
-	}
-
-	gpiofd = open("/sys/class/gpio/export", O_WRONLY | O_SYNC);
-	if (gpiofd == -1)
-	{
-		g_logger->print(LOG_ERR, "%s: Cannot modify \"/sys/class/gpio/export\": %s\n", __func__, gpio, strerror(errno));
-		return -1;
-	}
-	else
-	{
-		sprintf(buf, "%d", gpio);
-		ret = write(gpiofd, buf, strlen(buf));
-		if (ret < 0)
-		{
-			g_logger->print(LOG_ERR, "%s: Export GPIO %d failed: %s\n", __func__, gpio, strerror(errno));
-			return -2;
-		}
-		close(gpiofd);
-	}
-
-	return 0;
-}
-
-//-----------------------------------------------------------------------------
-void gpio_unexport(int gpio)
-{
-	int gpiofd, ret;
-	char buf[SMALL_BUFF_SIZE];
-	
-	
-	gpiofd = open("/sys/class/gpio/unexport", O_WRONLY | O_SYNC);
-	sprintf(buf, "%d", gpio);
-	ret = write(gpiofd, buf, strlen(buf));
-	close(gpiofd);
-}
-
-//-----------------------------------------------------------------------------
-int gpio_direction(int gpio, int dir)
-{
-	int ret = 0, gpiofd;
-	char buf[SMALL_BUFF_SIZE];
-
-
-	sprintf(buf, "/sys/class/gpio/gpio%d/direction", gpio);
-	gpiofd = open(buf, O_WRONLY | O_SYNC);
-	if (gpiofd < 0)
-	{
-		g_logger->print(LOG_ERR, "%s: Couldn't open direction file\n", __func__);
-		ret = -1;
-	}
-
-	if (dir == 2 && gpiofd)
-	{
-		if (write(gpiofd, "high", 4) != 4)
-		{
-			g_logger->print(LOG_ERR, "%s: Couldn't set GPIO %d direction to out/high: %s\n", __func__, gpio, strerror(errno));
-			ret = -2;
-		}
-	}
-	else if (dir == 1 && gpiofd)
-	{
-		if (write(gpiofd, "out", 3) != 3)
-		{
-			g_logger->print(LOG_ERR, "%s: Couldn't set GPIO %d direction to out/low: %s\n", __func__, gpio, strerror(errno));
-			ret = -3;
-		}
-	}
-	else if (gpiofd)
-	{
-		if (write(gpiofd, "in", 2) != 2)
-		{
-			g_logger->print(LOG_ERR, "%s: Couldn't set GPIO %d direction to in: %s\n", __func__, gpio, strerror(errno));
-			ret = -4;
-		}
-	}
-
-	close(gpiofd);
-	return ret;
-}
-
-//-----------------------------------------------------------------------------
-int gpio_read(int gpio)
-{
-	char in[3] = { 0, 0, 0 };
-	char buf[SMALL_BUFF_SIZE];
-	int nread, gpiofd;
-
-
-	sprintf(buf, "/sys/class/gpio/gpio%d/value", gpio);
-	gpiofd = open(buf, O_RDWR | O_SYNC);
-	if (gpiofd < 0)
-	{
-		g_logger->print(LOG_ERR, "%s: Failed to open gpio %d value: %s\n", __func__, gpio, strerror(errno));
-		return -1;
-	}
-
-	do {
-		nread = read(gpiofd, in, 1);
-	} while (nread == 0);
-	if (nread == -1)
-	{
-		g_logger->print(LOG_ERR, "%s: gpio %d read failed: %s\n", __func__, gpio, strerror(errno));
-
-		return -2;
-	}
-
-	close(gpiofd);
-	return atoi(in);
-}
-
-//-----------------------------------------------------------------------------
-int gpio_write(int gpio, int val)
-{
-	char buf[50];
-	int nread, ret, gpiofd;
-
-
-	sprintf(buf, "/sys/class/gpio/gpio%d/value", gpio);
-	gpiofd = open(buf, O_RDWR);
-	if (gpiofd < 0)
-	{
-		g_logger->print(LOG_ERR, "%s: Failed to open gpio %d value: %s\n", __func__, gpio, strerror(errno));
-		return -1;
-	}
-
-	snprintf(buf, 2, "%d", val ? 1 : 0);
-	ret = write(gpiofd, buf, 2);
-	if (ret < 0)
-	{
-		g_logger->print(LOG_ERR, "%s: Failed to set gpio %d: %s\n", __func__, gpio, strerror(errno));
-		return -2;
-	}
-
-	close(gpiofd);
-	if (ret == 2) return 0;
 }
 
 //-----------------------------------------------------------------------------
@@ -373,7 +264,7 @@ int pwm_export(int pwm)
 	pwmfd = open("/sys/class/pwm/pwmchip0/export", O_WRONLY | O_SYNC);
 	if (pwmfd == -1)
 	{
-		g_logger->print(LOG_ERR, "%s: Cannot modify PWM: %s\n", __func__, pwm, strerror(errno));
+		g_logger->print(LOG_ERR, "%s: Cannot open pwmchip0: %s\n", __func__, pwm, strerror(errno));
 		return -1;
 	}
 	else
@@ -388,6 +279,7 @@ int pwm_export(int pwm)
 		close(pwmfd);
 	}
 
+	g_logger->print(LOG_INFO, "%s: Finished PWM #%d\n", __func__, pwm);
 	return 0;
 }
 
@@ -402,77 +294,102 @@ void pwm_unexport(int pwm)
 	sprintf(buf, "%d", pwm);
 	ret = write(pwmfd, buf, strlen(buf));
 	close(pwmfd);
+	
+	g_logger->print(LOG_INFO, "%s: Finished PWM #%d\n", __func__, pwm);
 }
 
 //-----------------------------------------------------------------------------
-int pwm_read(int pwm, unsigned long *period_ns, unsigned long *duty_ns, unsigned long *enable)
+IEC_UDINT pwm_read(int pwm)
 {
-/*
-	int pwmfd, ret, nread;
+	int pwmfd, nread;
 	char buf[SMALL_BUFF_SIZE];
 	char read_buf[SMALL_BUFF_SIZE];
-	char pwm_parameters[3] = { "period", "duty_cycle", "enable" };
-	char *endptr;
-	unsigned long *values[3] = { period_ns , duty_ns , enable };
+	char *endptr = read_buf;
+	IEC_UINT retval = 0;
 
 
-	for (int i = 0; i < ARRAY_SIZE(pwm_parameters); i++)
+	sprintf(buf, "/sys/class/pwm/pwmchip0/pwm%d/duty_cycle", pwm);
+	pwmfd = open(buf, O_RDWR | O_SYNC);
+	if (pwmfd < 0)
 	{
-		sprintf(buf, "/sys/class/pwm/pwmchip0/pwm%d/%s", pwm, pwm_parameters[i]);
-		pwmfd = open(buf, O_RDWR | O_SYNC);
-		if (pwmfd < 0)
-		{
-			g_logger->print(LOG_ERR, "%s: Failed to open PWM %d: %s\n", __func__, pwm, strerror(errno));
-			return -1;
-		}
-
-		nread = read(pwmfd, read_buf, SMALL_BUFF_SIZE);
-		if (nread <= 0)
-		{
-			g_logger->print(LOG_ERR, "%s: Failed to read PWM %d: %s\n", __func__, pwm, strerror(errno));
-			return -2
-		}
-
-		*(values[i]) = strtol(read_buf, &endptr, 10);
-
-		close(pwmfd);
+		g_logger->print(LOG_ERR, "%s: Failed to open PWM %d: %s\n", __func__, pwm, strerror(errno));
+		return -1;
 	}
+
+	nread = read(pwmfd, read_buf, SMALL_BUFF_SIZE);
+	if (nread <= 0)
+	{
+		g_logger->print(LOG_ERR, "%s: Failed to read PWM %d: %s\n", __func__, pwm, strerror(errno));
+		return -2;
+	}
+
+	close(pwmfd);
+
+	retval = (IEC_UINT)(strtod(read_buf, &endptr) / PWM_DUTY_SCALING);
+	return retval;
+}
+
+//-----------------------------------------------------------------------------
+/*
+PCA9685 PWM write logic.
+
+500Hz period = 2000000
+IEC_UINT: [0, 65535]
+duty cycle: [0, 2000000]
+when duty cycle == 0 -> disable
+
+# echo 2000000 > /sys/class/pwm/pwmchip0/pwmX/period"
+# echo 500000 > /sys/class/pwm/pwmchip0/pwmX/duty_cycle
 */
+
+int write_pwm_param(int pwm, const char* param_name, IEC_UDINT value)
+{
+	int pwmfd, ret;
+	char name_buf[SMALL_BUFF_SIZE];
+	char write_buf[SMALL_BUFF_SIZE];
+
+
+	//g_logger->print(LOG_INFO, "%s: PWM %d <-- \"%s\" : %lu\n", __func__, pwm, param_name, value);
+
+	sprintf(name_buf, "/sys/class/pwm/pwmchip0/pwm%d/%s", pwm, param_name);
+	pwmfd = open(name_buf, O_RDWR | O_SYNC);
+	if (pwmfd < 0)
+	{
+		g_logger->print(LOG_ERR, "%s: Failed to open PWM %d: %s\n", __func__, pwm, strerror(errno));
+		return -1;
+	}
+
+	snprintf(write_buf, SMALL_BUFF_SIZE, "%lu", value);
+	ret = write(pwmfd, write_buf, SMALL_BUFF_SIZE);
+	if (ret < 0)
+	{
+		g_logger->print(LOG_ERR, "%s: Failed to set PWM %d: %s\n", __func__, pwmfd, strerror(errno));
+		return -2;
+	}
+
+	close(pwmfd);
+
 	return 0;
 }
 
 //-----------------------------------------------------------------------------
-int pwm_write(int pwm, unsigned long period_ns, unsigned long duty_ns, int enable)
+int pwm_write(int pwm, IEC_UDINT value)
 {
-/*
-	int pwmfd, ret, nread;
-	char buf[SMALL_BUFF_SIZE];
-	char write_buf[SMALL_BUFF_SIZE];
-	char pwm_parameters[3] = { "period", "duty_cycle", "enable" };
-	char *endptr;
-	unsigned long *values[3] = { &period_ns , &duty_ns , &enable };
+	IEC_UDINT pwm_value;
 
 
-	for (int i = 0; i < ARRAY_SIZE(pwm_parameters); i++)
+	pwm_value = (unsigned long)((double)value * PWM_DUTY_SCALING);
+	if (pwm_value != g_int_pwm_val_buffer[pwm])
 	{
-		sprintf(buf, "/sys/class/pwm/pwmchip0/pwm%d/%s", pwm, pwm_parameters[i]);
-		pwmfd = open(buf, O_RDWR | O_SYNC);
-		if (pwmfd < 0)
-		{
-			g_logger->print(LOG_ERR, "%s: Failed to open PWM %d: %s\n", __func__, pwm, strerror(errno));
-			return -1;
-		}
+		g_int_pwm_val_buffer[pwm] = pwm_value;
+		write_pwm_param(pwm, "duty_cycle", pwm_value);
 
-		snprintf(write_buf, SMALL_BUFF_SIZE, "%d", *(values[i]));
-		ret = write(pwmfd, write_buf, SMALL_BUFF_SIZE);
-		if (ret < 0)
+		if (g_bool_pwm_en_buffer[pwm] != 1)
 		{
-			g_logger->print(LOG_ERR, "%s: Failed to set PWM %d: %s\n", __func__, pwmfd, strerror(errno));
-			return -2;
+			g_bool_pwm_en_buffer[pwm] = 1;
+			write_pwm_param(pwm, "enable", 1);
 		}
-
-		close(pwmfd);
 	}
-*/
+
 	return 0;
 }
